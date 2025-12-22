@@ -1,0 +1,310 @@
+import requests
+import concurrent.futures
+import json
+import time
+import os
+from datetime import datetime, timedelta
+from itertools import permutations
+from itertools import combinations
+import networkx as nx
+from networkx.classes.function import path_weight
+import matplotlib.pyplot as plt
+import alpaca_trade_api as tradeapi
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import (
+AssetClass,
+AssetStatus,
+OrderSide,
+OrderType,
+TimeInForce,
+QueryOrderStatus
+)
+import requests
+
+from alpaca.trading.requests import (
+GetAssetsRequest,
+MarketOrderRequest,
+LimitOrderRequest,
+StopLimitOrderRequest,
+GetOrdersRequest,
+ClosePositionRequest
+)
+# authentication and connection details
+api_key = 'PKRVBNHO142BFH5EBVXZ'
+api_secret = '6vRJ104oyku32xveAveDYcZfnV9Ht4lO46nmF52y'
+base_url = 'https://paper-api.alpaca.markets/'
+
+
+DATA_URL = 'https://data.alpaca.markets/v1beta2/crypto'
+HEADERS = {
+'APCA-API-KEY-ID': api_key,
+'APCA-API-SECRET-KEY': api_secret
+}
+
+# List of coins with their tickers and CoinGecko IDs
+# coins_and_tokens = [
+#     ["btc", "bitcoin"],
+#     ["eth", "ethereum"],
+#     ["ltc", "litecoin"],
+#     ["eos", "eos"],
+#     ["bch", "bitcoin-cash"],
+#     ["bnb", "binancecoin"],
+#     ["doge", "dogecoin"],
+#     ["ton", "the-open-network"],
+#     ["xrp", "ripple"],
+#     ["shib", "shiba-inu"],
+#     ["avax", "avalanche-2"],
+#     ["dot", "polkadot"],
+#     ["bch", "bitcoin-cash"]
+# ]
+
+coins_and_tokens = [
+    ["btc", "bitcoin"],
+    ["eth", "ethereum"],
+    ["ltc", "litecoin"],
+    ["bch", "bitcoin-cash"],
+    ["doge", "dogecoin"],
+    ["shib", "shiba-inu"],
+    ["avax", "avalanche-2"],
+    ["dot", "polkadot"],
+    ["aave", "aave"],
+    ["link", "chainlink"],
+    ["mkr", "maker"],
+    ["uni", "uniswap"],
+    ["xtz", "tezos"]
+]
+
+def create_orders(path, initial_quantity,g):
+    """
+    Creates a dictionary of alternating sell and buy orders for a given path of cryptocurrencies.
+
+    Parameters:
+    - path (list of tuples): Each tuple contains (coin_symbol, edge_weight).
+      - coin_symbol (str): The symbol of the cryptocurrency (e.g., 'BTCUSD').
+      - edge_weight (float): The exchange rate to the next coin in the path.
+    - initial_quantity (float): The quantity of the first coin to sell.
+
+    Returns:
+    - dict: A dictionary where keys are order symbols and values are MarketOrderRequest objects.
+    """
+    orders = {}
+    quantity = initial_quantity
+
+    for i in range(len(path) - 1):
+        current_coin = path[i]
+        next_coin = path[i + 1]
+        edge_weight = g[current_coin][next_coin].get("weight",1)
+        # Determine the side of the order
+        if i % 2 == 0:
+            # Sell current_coin
+            side = OrderSide.SELL
+            symbol = f'{current_coin.upper()}/USD'
+        else:
+            # Buy next_coin
+            side = OrderSide.BUY
+            symbol = f'{next_coin.upper()}/USD'
+            # Adjust quantity for the next buy order
+        
+        # Create a market order request
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=quantity,
+            side=side,
+            time_in_force=TimeInForce.GTC
+        )
+        quantity *= edge_weight * 0.99  # Apply safety margin
+        # Add the order to the dictionary
+        orders[symbol] = order
+
+    return orders
+
+def init():
+    #for all the symbols in coins_and_tokens, make an orders dictionary that would enable us to buy 1 coin of each currency
+    orders = {}
+    for ticker, _ in coins_and_tokens:
+        ticker_upper = ticker.upper()
+        symbol = ticker_upper+'/'+'USD'
+        order = MarketOrderRequest(
+            symbol=symbol,
+            qty=1,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.GTC
+        )
+        orders[symbol] = order
+    return orders
+
+def find_disequilibrium(threshold=0):
+
+
+    # Separate lists for coin IDs (CoinGecko IDs) and coin tickers (symbols)
+    coin_ids = []
+    coin_tickers = []
+    for coin_and_token in coins_and_tokens:
+        coin_ids.append(coin_and_token[1])      # CoinGecko IDs
+        coin_tickers.append(coin_and_token[0])  # Ticker symbols
+
+    # Create comma-separated strings for the API URL
+    coin_ids_str = ",".join(coin_ids)
+    # print(coin_ids_str)
+
+    coin_tickers_str = ",".join(coin_tickers)
+    # print(coin_tickers_str)
+
+    # Create a directed graph to represent the currency exchange rates
+    g = nx.DiGraph()
+    edges = []
+
+    # Querying CoinGecko API for currency exchange rates
+    url_base = "https://api.coingecko.com/api/v3/simple/price?ids="
+    url_params = "&vs_currencies="
+    url = url_base + coin_ids_str + url_params + coin_tickers_str
+
+    req = requests.get(url)
+    rate = json.loads(req.text)
+
+    # Build edges for the graph based on exchange rates
+    # Each edge represents an exchange rate from one currency to another
+    for c1, c2 in permutations(coins_and_tokens, 2):  # querying all permutations of currency pairs
+        ticker1, id1 = c1[0], c1[1]
+        ticker2 = c2[0]
+        if id1 in rate and ticker2 in rate[id1]:
+            exchange_rate = rate[id1][ticker2]
+            edges.append((ticker1, ticker2, exchange_rate))
+
+    # Add edges with weights to the graph
+    g.add_weighted_edges_from(edges)
+
+    # graph_visual_file = "currencies_graph_visual.png"
+    # pos = nx.circular_layout(g)
+    # nx.draw_networkx(g, pos)
+    # labels = nx.get_edge_attributes(g, 'weight')
+    # nx.draw_networkx_edge_labels(g, pos, edge_labels=labels)
+
+    # plt.savefig(graph_visual_file)
+
+    # Initialize dictionaries to store all paths and their weights
+    all_paths = {}        # Dictionary to store all paths between coins
+    path_weights = {}     # Dictionary to store the weight (product of exchange rates) of each path
+
+    # Find all simple paths between all pairs of nodes and calculate their weights
+    for coin1 in g.nodes:
+        for coin2 in g.nodes:
+            if coin1 != coin2:
+                # Find all simple paths from coin1 to coin2
+                all_paths[coin1, coin2] = list(nx.all_simple_paths(g, coin1, coin2))
+                for path in all_paths[(coin1, coin2)]:
+                    product = 1  # Initialize the product to 1
+                    # Iterate over each pair of consecutive nodes in the path
+                    for u, v in zip(path[:-1], path[1:]):
+                        # Retrieve the weight of the edge (u, v)
+                        edge_weight = g[u][v].get('weight', 1)  # Default weight is 0 if not specified
+                        # Multiply the product by the edge weight
+                        product *= edge_weight
+                    # Store the product in the dictionary
+                    # Convert the path to a string to use as a key
+                    path_str = str(path)
+                    path_weights[path_str] = product
+
+    # Prepare to store the smallest and largest path factors
+    smallest_path_factor = float('inf')
+    smallest_path = None
+    largest_path_factor = float('-inf')
+    largest_path = None
+
+    # Use combinations to process each unique pair only once
+    for coin1, coin2 in combinations(g.nodes, 2):
+        trade_done=False
+        if trade_done:
+            break
+        paths_forward = all_paths.get((coin1, coin2), [])
+        # print(f"paths from  {coin1} to {coin2} ----------------------------------")
+        for path in paths_forward:
+            if trade_done:
+                break
+            # Reverse the path to get the reverse path
+            path_rev = path[::-1]
+            # Convert paths to strings to use as keys
+            path_str = str(path)
+            path_rev_str = str(path_rev)
+            # Check if both forward and reverse paths exist in path_weights
+            if path_str in path_weights and path_rev_str in path_weights:
+                if trade_done:
+                    break
+                # Get the weights of the forward and reverse paths
+                forward_weight = path_weights[path_str]
+                reverse_weight = path_weights[path_rev_str]
+                # Calculate the path factor
+                both_prods = forward_weight * reverse_weight
+                # print(f"{both_prods}\n")
+                if both_prods != 1:
+                    if trade_done:
+                        break
+                    #There is disequilibrium from {coin1} to {coin2} going through {path} with product from both sides being {both_prods}
+                    # Update smallest and largest path factors
+                    if both_prods < smallest_path_factor:
+                        smallest_path = path
+                        smallest_path_factor = both_prods
+                    if both_prods > largest_path_factor:
+                        largest_path = path
+                        largest_path_factor = both_prods
+                    if both_prods>(1+threshold/100):
+                        print("should trade on",path,path[::-1],both_prods)
+                        order_path=path[:-1]+path[::-1]
+                        print(order_path)
+                        creatd=create_orders(order_path,1,g)
+                        place_orders(creatd)
+                        print(creatd)
+                        trade_done = True
+                        return
+
+    # Output the smallest and greatest path weight factors
+    print("\nSmallest Paths weight factor:", smallest_path_factor)
+    print("Paths:", smallest_path, smallest_path[::-1])
+    print("Greatest Paths weight factor:", largest_path_factor)
+    print("Paths:", largest_path, largest_path[::-1])
+    return (largest_path, largest_path_factor)
+
+# instantiate REST API
+api = tradeapi.REST(api_key, api_secret, base_url, api_version='v2')
+trading_client = TradingClient(api_key=api_key, secret_key=api_secret, paper=True, url_override=None)
+
+
+
+#pass threshold percentage
+# find_disequilibrium(threshold=0.16)
+
+def submit_order(symbol, qty, side):
+    order_data = MarketOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=side,
+        time_in_force=TimeInForce.GTC
+    )
+    try:
+        order = trading_client.submit_order(order_data=order_data)
+        print(f"Order submitted: {order}")
+    except Exception as e:
+        print(f"Failed to submit order for {symbol}: {e}")
+
+def place_orders(orders):
+    # Use ThreadPoolExecutor to submit orders concurrently
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        futures = [executor.submit(submit_order, orders[order].symbol, orders[order].qty, orders[order].side) for order in orders.keys()]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()  # Wait for all futures to complete
+
+def main():
+    # start_time = time.time()
+    # end_time = start_time + 60  # Run for 60 seconds
+    # interval = 2  # Interval in seconds
+
+    # while time.time() < end_time:
+    #     my_function()
+    #     time.sleep(interval)
+    orders=init()
+    find_disequilibrium(threshold=0.02)
+    # place_orders(orders) #uncomment this to initialize your account with 1 coin of each currency
+
+
+if __name__ == "__main__":
+    main()
